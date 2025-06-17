@@ -1,0 +1,248 @@
+#!/usr/bin/env -S uv run --quiet --script
+
+"""
+Follow phpBB forum threads and create macos notifications
+for new posts.
+"""
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#    "playwright",
+#    "toml",
+#    "click",
+# ]
+# ///
+
+import os
+import sys
+import time
+from typing import Tuple, Union
+
+import click
+from playwright.sync_api import sync_playwright, Page, TimeoutError, Error
+import toml
+
+# --- TYPES AND EXCEPTIONS --- #
+type PostId = str
+type ThreadTitle = str
+type PostContent = str
+type PhpBBNotifierConfiguration = dict
+
+
+class PaginationNotFoundException(Exception):
+    pass
+
+
+class PostIDNotFoundException(Exception):
+    pass
+
+
+# --- CONSTANTS --- #
+
+DATA_PATH = "data"
+DEFAULT_CONFIG_FILE_NAME = "phpbbnotifier.config.toml"
+DEFAULT_INTERVAL = 5 * 60
+
+# --- HELPERS --- #
+
+
+def read_configuration(config_path) -> PhpBBNotifierConfiguration:
+    try:
+        with open(config_path) as config_file:
+            return toml.load(config_file)
+    except FileNotFoundError:
+        print(f"FATAL ERROR :: A {config_path} configuration file is required.")
+        sys.exit(1)
+    except TypeError as err:
+        print("FATAL ERROR :: Could not load configuration.")
+        print(err)
+        sys.exit(1)
+    except toml.TomlDecodeError as err:
+        print("FATAL ERROR :: Invalid configuration.")
+        print(err)
+        sys.exit(1)
+
+
+def send_notification(title: str, text: str) -> None:
+    """Uses osascript to display a native macos notification.
+
+    You need to give notifications permission to ScriptEditor for these
+    notifications to show up.
+    """
+
+    text = text.replace('"', '\\"')
+
+    os.system(
+        """osascript -e 'display notification "{}" with title "{}"'""".format(
+            text, title
+        )
+    )
+
+
+def goto_last_page(page: Page) -> Page:
+    """Finds the link to the last page of a thread and clicks it."""
+    paginations = page.locator(".pagination").all()
+    if not paginations:
+        raise PaginationNotFoundException("No navigation found on the page")
+
+    first_nav = paginations[0]
+    list_items = first_nav.locator("li").all()
+
+    try:
+        last_page_list_item = list_items[-2]
+        last_page_link = last_page_list_item.locator("a")
+
+        last_page_link.click()
+    except IndexError:
+        # In case of single-page thread, there's no navigation to click
+        # but we can still continue with the flow
+        pass
+
+    return page
+
+
+def get_newest_post(page: Page) -> Tuple[PostId, ThreadTitle, PostContent]:
+    """Finds the post id, thread title and content for the newest post in the thread."""
+    goto_last_page(page)
+    try:
+        newest_post = page.locator(".post").last
+        newest_post_id = newest_post.get_attribute("id").replace("p", "")
+        newest_post_content = newest_post.locator(".content").text_content()
+        thread_title = page.locator("h2").text_content()
+        return newest_post_id, thread_title, newest_post_content
+    except TimeoutError as err:
+        raise PostIDNotFoundException("ERROR :: No post ID found")
+
+
+def read_latest_value(file_path: str) -> Union[int, None]:
+    if os.path.exists(file_path):
+        with open(file_path) as f:
+            try:
+                return int(f.read().strip())
+            except ValueError:
+                return None
+    return None
+
+
+def store_newest_post_id(file_path: str, newest_post_id: PostId) -> None:
+    with open(file_path, "w") as f:
+        f.write(newest_post_id)
+
+
+@click.command()
+@click.option(
+    "--config",
+    default=DEFAULT_CONFIG_FILE_NAME,
+    help="Path to configuration file. Default = phpbbnotifier.config.toml",
+)
+@click.option(
+    "--interval",
+    default=DEFAULT_INTERVAL,
+    help="Time between retries (in seconds). Default = 300.",
+)
+def run(config, interval) -> Tuple[str, int]:
+    """Watch phpBB forum threads and send macos notification if there are new posts."""
+
+    configuration = read_configuration(config)
+    main(configuration, interval)
+
+
+# --- MAIN FUNCTIONALITY --- #
+
+
+def main(configuration: PhpBBNotifierConfiguration, interval: int) -> None:
+    """Based on given configuration of forums, subforums and threads,
+    starts an endless loop where at given intervals, checks each thread to see
+    if there are new posts and if there is, sends a macos notification with
+    thread title and last message information.
+
+    Hit CTRL+C to stop.
+    """
+
+    # Keep track of URLs that fail so we don't try over and over again.
+    failed_urls = set()
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.firefox.launch()
+        except Error:
+            print(
+                f"FATAL ERROR :: Playwright browsers need to be installed. See instructions at https://playwright.dev/python/docs/browsers"
+            )
+            sys.exit(1)
+
+        context = browser.new_context()
+        page = context.new_page()
+
+        print(f"Checks threads every {interval // 60} minutes. Hit CTRL+C to stop.")
+        try:
+            while True:
+                for forum in configuration.values():
+                    base_url = forum.get("baseurl")
+                    if base_url is None:
+                        print(f"{forum} is missing baseurl, cannot open.")
+                        continue
+                    subforums = (
+                        subforum for key, subforum in forum.items() if key != "baseurl"
+                    )
+                    for subforum in subforums:
+                        subforum_id = subforum.get("id")
+                        if subforum_id is None:
+                            print(f"{subforum} is missing an id, cannot read.")
+                            continue
+                        for thread_id in subforum.get("threads", []):
+                            page_url = f"{base_url}?f={subforum_id}&t={thread_id}"
+
+                            if page_url in failed_urls:
+                                continue
+
+                            response = page.goto(page_url)
+
+                            if response.status >= 300:
+                                print(
+                                    f"ERROR {response.status} {response.status_text}: could not navigate to {page_url}"
+                                )
+                                failed_urls.add(page_url)
+                                continue
+
+                            try:
+                                newest_post_id, thread_title, newest_post_content = (
+                                    get_newest_post(page)
+                                )
+                            except PaginationNotFoundException as err:
+                                print(
+                                    f"ERROR :: Page {page_url} does not have a pagination as it likely is not a valid thread page. This URL will not be tried again."
+                                )
+                                failed_urls.add(page_url)
+                                continue
+                            except PostIDNotFoundException as err:
+                                print(
+                                    f"ERROR :: Post ID for {page_url} not found. This URL will not be tried again."
+                                )
+                                failed_urls.add(page_url)
+                                continue
+
+                            file_path = f"{DATA_PATH}/{thread_id}.txt"
+                            last_read_post_id = read_latest_value(file_path)
+                            if (
+                                last_read_post_id
+                                and int(newest_post_id) > last_read_post_id
+                            ):
+                                send_notification(
+                                    f"New post in {thread_title}", newest_post_content
+                                )
+
+                            store_newest_post_id(file_path, newest_post_id)
+
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    if not os.path.exists("data/"):
+        os.mkdir("data")
+
+    run()
