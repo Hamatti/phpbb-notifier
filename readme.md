@@ -40,4 +40,20 @@ Then, start the script with
 
 and it will run every 5 minutes and add a notification banner if new posts have been made.
 
+### CLI arguments
+
+You can adjust the behaviour with two command-line flags:
+
+```shell
+./phpbb-notifier --config=PATH_TO_CONFIG_FILE
+```
+
+will override the default configuration file location and
+
+```shell
+./phpbb-notifier --interval=120
+```
+
+will override the time that is spent between checks.
+
 If any URLs return 4xx or 5xx status codes, they will be removed from the checks until restarted.
