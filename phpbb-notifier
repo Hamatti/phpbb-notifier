@@ -18,6 +18,8 @@ import os
 import sys
 import time
 from typing import Tuple, Union
+import shutil
+
 
 import click
 from playwright.sync_api import sync_playwright, Page, TimeoutError, Error
@@ -64,20 +66,32 @@ def read_configuration(config_path) -> PhpBBNotifierConfiguration:
         sys.exit(1)
 
 
-def send_notification(title: str, text: str) -> None:
-    """Uses osascript to display a native macos notification.
+def send_notification(title: str, text: str, url: str) -> None:
+    """Sends a notification using either terminal-notifier if
+    installed or macos's native notification system through osascript.
 
-    You need to give notifications permission to ScriptEditor for these
+    You need to give notifications permission to ScriptEditor for osascript
     notifications to show up.
+
+    The terminal-notifier notification opens the post URL in browser when clicked.
     """
 
     text = text.replace('"', '\\"')
 
-    os.system(
-        """osascript -e 'display notification "{}" with title "{}"'""".format(
-            text, title
+    terminal_notifier_exists = shutil.which("terminal-notifier")
+
+    if terminal_notifier_exists:
+        os.system(
+            """terminal-notifier -message "{}" -title "{}" -open "{}" """.format(
+                text, title, url
+            )
         )
-    )
+    else:
+        os.system(
+            """osascript -e 'display notification "{}" with title "{}"'""".format(
+                text, title
+            )
+        )
 
 
 def goto_last_page(page: Page) -> Page:
@@ -110,7 +124,8 @@ def get_newest_post(page: Page) -> Tuple[PostId, ThreadTitle, PostContent]:
         newest_post_id = newest_post.get_attribute("id").replace("p", "")
         newest_post_content = newest_post.locator(".content").text_content()
         thread_title = page.locator("h2").text_content()
-        return newest_post_id, thread_title, newest_post_content
+        newest_post_url = page.url + newest_post.locator("h3 a").get_attribute("href")
+        return newest_post_id, thread_title, newest_post_content, newest_post_url
     except TimeoutError as err:
         raise PostIDNotFoundException("ERROR :: No post ID found")
 
@@ -207,9 +222,12 @@ def main(configuration: PhpBBNotifierConfiguration, interval: int) -> None:
                                 continue
 
                             try:
-                                newest_post_id, thread_title, newest_post_content = (
-                                    get_newest_post(page)
-                                )
+                                (
+                                    newest_post_id,
+                                    thread_title,
+                                    newest_post_content,
+                                    newest_post_url,
+                                ) = get_newest_post(page)
                             except PaginationNotFoundException as err:
                                 print(
                                     f"ERROR :: Page {page_url} does not have a pagination as it likely is not a valid thread page. This URL will not be tried again."
@@ -230,7 +248,9 @@ def main(configuration: PhpBBNotifierConfiguration, interval: int) -> None:
                                 and int(newest_post_id) > last_read_post_id
                             ):
                                 send_notification(
-                                    f"New post in {thread_title}", newest_post_content
+                                    f"New post in {thread_title}",
+                                    newest_post_content,
+                                    newest_post_url,
                                 )
 
                             store_newest_post_id(file_path, newest_post_id)
